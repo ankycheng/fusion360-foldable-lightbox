@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Per-install UI state — don't ship a user's last settings
+FoldableLightbox/last_settings.json

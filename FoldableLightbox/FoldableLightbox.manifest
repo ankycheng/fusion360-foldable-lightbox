@@ -1,0 +1,13 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "id": "a720bc3e-d150-44b0-a0ce-f36d0f2d6195",
+  "author": "Anky Cheng",
+  "description": {
+    "": "Parametric foldable lightbox (Triangle / Trapezoid / Square) with optional end caps"
+  },
+  "version": "0.2.0",
+  "runOnStartup": false,
+  "supportedOS": "windows|mac",
+  "editEnabled": true
+}
