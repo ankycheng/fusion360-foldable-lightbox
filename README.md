@@ -67,6 +67,19 @@ Click **OK** — a `Lightbox_{Profile}` component appears at origin, containing 
 
 ## Changelog
 
+### v0.3.0 (2026-04-23)
+- **Through-cut + Emboss** text mode — letters cut through the sheet AND extrude above it (raised backlit signage)
+- **Through-cut inner islands** kept as separate sheet-colored bodies (O, A, D, P, B, R, Q); fuse back on the first print layer
+- **Bottom switch boss** with countersink — flat boss on the base panel for a panel-mount switch
+- **4-hole mount pattern** on the base panel (cross layout, configurable spacing + diameter)
+- **Garmin quarter-turn connector mount** — imports `garmin_connector_male.step` and nests it under the `Lightbox_*` parent, rotated so the flange contacts the sheet
+- **Thin seam tab** at the fold seam for cleaner assembly
+- **End-cap cutouts** (Cap 1: plain through-hole; Cap 2: USB-C stadium port)
+- **USB-C vertical offset** so the port can be shifted off-center on the cap
+- **Cap 2 PCB blind slot** — inner-face pocket below the USB-C port to hold a PCB edge; keeps ≥0.8 mm back wall
+- **Tighter text auto-fit** — consolidated margin factors; text now fills the full usable panel width (~97%)
+- Fix: text bodies with inner islands reliably move into the `Text` sub-component (captured refs + fallback scan)
+
 ### v0.2.0 (2026-04-20)
 - Fix: polygon offset collapse detection — rejects degenerate / inverted offsets when profile is too small for the clearance
 - Fix: `text_autosize_depth` bumps depth up so end-cap recess bands fit (previously could silently break the rabbet fit)

@@ -6,7 +6,7 @@
   "description": {
     "": "Parametric foldable lightbox (Triangle / Trapezoid / Square) with optional end caps"
   },
-  "version": "0.2.0",
+  "version": "0.3.0",
   "runOnStartup": false,
   "supportedOS": "windows|mac",
   "editEnabled": true

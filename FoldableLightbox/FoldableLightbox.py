@@ -13,6 +13,21 @@ CMD_ID = "FoldableLightbox_cmd"
 CMD_NAME = "Foldable Lightbox"
 CMD_DESC = "Parametric foldable lightbox (Triangle / Trapezoid / Square) with optional end caps"
 
+# Custom event used to defer STEP import outside the command execute context.
+# Fusion documents importToTarget as unsupported inside command events — calling
+# it there can crash Fusion. A custom event fires on the main thread AFTER the
+# command loop unwinds, so importToTarget runs safely there.
+GARMIN_IMPORT_EVENT_ID = "FoldableLightbox_doGarminImport"
+_garmin_import_event = None  # keep a module-level handle for stop() cleanup
+# Queue of pending Garmin STEP imports. Each entry is a dict with:
+#   - step_path   : absolute path to the Garmin connector STEP file
+#   - depth_cm    : sheet depth (for X centering)
+#   - base_y_mid_cm : base panel Y midpoint (for Y centering)
+#   - sheet_t_cm  : sheet thickness (unused for Z now — we want Z=0)
+#   - pre_names   : set() of root.occurrences names before the import, so the
+#                   handler can identify the newly-added occurrence
+_pending_garmin_imports = []
+
 _SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_settings.json")
 
 
@@ -40,7 +55,7 @@ def _vi(s, key, default_str):
 
 
 def run(context):
-    global _app, _ui
+    global _app, _ui, _garmin_import_event
     try:
         _app = adsk.core.Application.get()
         _ui = _app.userInterface
@@ -54,6 +69,25 @@ def run(context):
         cmd_def.commandCreated.add(on_created)
         _handlers.append(on_created)
 
+        # Register the deferred-STEP-import custom event. It's fired from
+        # add_garmin_mount() inside onExecute, but Fusion queues the dispatch
+        # so the handler runs outside command scope where importToTarget works.
+        # registerCustomEvent returns None if the id was already registered
+        # (e.g. add-in was Stop-Run'd without a full Fusion restart) — in that
+        # case, unregister first then re-register so we rebind to a fresh handler.
+        ev = _app.registerCustomEvent(GARMIN_IMPORT_EVENT_ID)
+        if ev is None:
+            _app.unregisterCustomEvent(GARMIN_IMPORT_EVENT_ID)
+            ev = _app.registerCustomEvent(GARMIN_IMPORT_EVENT_ID)
+        if ev is not None:
+            garmin_handler = GarminImportHandler()
+            added = ev.add(garmin_handler)
+            _handlers.append(garmin_handler)
+            _garmin_import_event = ev
+            _log(f"run(): garmin custom event registered, handler.add returned {added}")
+        else:
+            _log("run(): registerCustomEvent returned None twice — deferred Garmin import will not work")
+
         ws = _ui.workspaces.itemById("FusionSolidEnvironment")
         panel = ws.toolbarPanels.itemById("SolidCreatePanel")
         if not panel.controls.itemById(CMD_ID):
@@ -64,7 +98,7 @@ def run(context):
 
 
 def stop(context):
-    global _handlers
+    global _handlers, _garmin_import_event
     try:
         ws = _ui.workspaces.itemById("FusionSolidEnvironment")
         panel = ws.toolbarPanels.itemById("SolidCreatePanel")
@@ -74,18 +108,198 @@ def stop(context):
         cmd_def = _ui.commandDefinitions.itemById(CMD_ID)
         if cmd_def:
             cmd_def.deleteMe()
+        if _app is not None:
+            try:
+                _app.unregisterCustomEvent(GARMIN_IMPORT_EVENT_ID)
+            except Exception:
+                pass
     except Exception:
         pass
     _handlers = []
+    _garmin_import_event = None
+
+
+_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "foldable_lightbox.log")
 
 
 def _log(msg):
+    line = f"[FoldableLightbox] {msg}"
     try:
         palette = _ui.palettes.itemById("TextCommands")
         if palette:
-            palette.writeText(f"[FoldableLightbox] {msg}")
+            palette.writeText(line)
     except Exception:
         pass
+    try:
+        import datetime as _dt
+        with open(_LOG_PATH, "a") as f:
+            f.write(f"{_dt.datetime.now().isoformat(timespec='seconds')}  {line}\n")
+    except Exception:
+        pass
+
+
+class GarminImportHandler(adsk.core.CustomEventHandler):
+    """Deferred STEP import handler. Fires *after* the Foldable Lightbox
+    command has fully finished, so importManager.importToTarget runs outside
+    command scope (where it is supported). Payload is a JSON dict with:
+      - mount_token: entityToken of the GarminMount placeholder occurrence
+      - step_path:   absolute path to the Garmin connector STEP file
+    """
+    def notify(self, args):
+        _log(f"garmin deferred: handler.notify() ENTERED; queue_size={len(_pending_garmin_imports)}")
+        if not _pending_garmin_imports:
+            _log("garmin deferred: queue empty, nothing to import")
+            return
+        while _pending_garmin_imports:
+            params = _pending_garmin_imports.pop(0)
+            _log(f"garmin deferred: processing params={list(params.keys())}")
+            self._run_one(params)
+
+    def _run_one(self, params):
+        try:
+            step_path = params["step_path"]
+            depth = params["depth_cm"]
+            base_y_mid = params["base_y_mid_cm"]
+            sheet_t = params.get("sheet_t_cm", 0.0)
+            pre_names = set(params.get("pre_names", []))
+
+            if not os.path.exists(step_path):
+                _log(f"garmin deferred: STEP file missing at {step_path}")
+                return
+
+            app = adsk.core.Application.get()
+            design = app.activeProduct
+            if not design or design.classType() != adsk.fusion.Design.classType():
+                _log(f"garmin deferred: active product is not a Design")
+                return
+            root = design.rootComponent
+
+            # Perform the STEP import at root. STEP will create a new linked
+            # child document and place its reference occurrence at root; the
+            # `target` argument is effectively ignored for STEP files.
+            im = app.importManager
+            opts = im.createSTEPImportOptions(step_path)
+            opts.isViewFit = False
+            im.importToTarget(opts, root)
+
+            # Diff root.occurrences against the pre-import snapshot to find
+            # the one we just added.
+            new_occ = None
+            for i in range(root.occurrences.count):
+                occ = root.occurrences.item(i)
+                if occ.name not in pre_names:
+                    new_occ = occ
+                    break
+            if new_occ is None:
+                _log("garmin deferred: could not identify new imported occurrence (names all pre-existing)")
+                return
+            _log(f"garmin deferred: new occurrence '{new_occ.name}' detected")
+
+            # The imported body sits in the CHILD component in its source STEP
+            # frame (Fusion does NOT auto-rotate Y-up → Z-up for this STEP).
+            # Verified via face-normal query:
+            #   X = disc width (ear-to-ear, ~28.8mm)
+            #   Y = disc THICKNESS axis; largest planar face has normal +Y
+            #       (the flange *mounting face* with the 3 screw holes — this
+            #        is the face that must rest on the sheet top)
+            #   Z = disc depth (perpendicular to ears, ~24.6mm)
+            #   -Y side carries the bayonet twist-lock tabs ("接口") which
+            #        must point AWAY from the sheet (into +Z).
+            # Rotation −90° around X: (x, y, z) → (x, z, −y). This maps:
+            #   +Y face (mounting, srcMaxY) → post-rot minZ = −srcMaxY  (BOTTOM)
+            #   −Y face (tabs,     srcMinY) → post-rot maxZ = −srcMinY  (TOP)
+            # Then translate so the mounting face lands on Z = sheet_t (sheet
+            # top surface) with the tabs protruding to Z = sheet_t + thickness.
+            body = None
+            if new_occ.component.bRepBodies.count > 0:
+                body = new_occ.component.bRepBodies.item(0)
+            if body is None:
+                _log("garmin deferred: imported occurrence has no body")
+                return
+            try:
+                body.name = "GarminConnector"
+            except Exception:
+                pass
+
+            bb = body.boundingBox
+            src_cx = (bb.minPoint.x + bb.maxPoint.x) / 2.0
+            src_cz = (bb.minPoint.z + bb.maxPoint.z) / 2.0
+            src_max_y = bb.maxPoint.y
+
+            Tx = depth / 2.0 - src_cx
+            Ty = base_y_mid - src_cz  # post-rot Y = +src_Z, so subtract src_cz
+            Tz = sheet_t + src_max_y  # mounting face (post-rot minZ = −srcMaxY) lands on Z = sheet_t
+
+            _log(f"garmin deferred: body local bbox X({bb.minPoint.x*10:.1f}..{bb.maxPoint.x*10:.1f}) "
+                 f"Y({bb.minPoint.y*10:.1f}..{bb.maxPoint.y*10:.1f}) "
+                 f"Z({bb.minPoint.z*10:.1f}..{bb.maxPoint.z*10:.1f})mm; "
+                 f"rot−90°X, translation=({Tx*10:.1f},{Ty*10:.1f},{Tz*10:.1f})mm")
+
+            # Find the Lightbox_{profile} parent occurrence at root level by name.
+            # build_lightbox creates exactly one per run, so name-prefix scan is
+            # unambiguous. root.occurrences.item() returns a natively-typed
+            # Occurrence, unlike findEntityByToken which returns a Base wrapper
+            # that SWIG rejects in moveToComponent.
+            parent_occ = None
+            _log(f"garmin deferred: scanning {root.occurrences.count} root occurrences for Lightbox_*")
+            try:
+                for i in range(root.occurrences.count):
+                    occ = root.occurrences.item(i)
+                    _log(f"garmin deferred:   [{i}] name='{occ.name}'")
+                    if occ.name.startswith("Lightbox_"):
+                        parent_occ = occ
+                        break
+            except Exception as e:
+                _log(f"garmin deferred: root.occurrences scan failed: {e}")
+
+            # CRITICAL ORDERING: moveToComponent returns a NEW Occurrence proxy
+            # in the target's assembly context. The old new_occ reference becomes
+            # stale (its assemblyContext still reports root, and transform set on
+            # it gets dropped when Fusion rebuilds the occurrence under the new
+            # parent). So:
+            #   1. Call moveToComponent FIRST
+            #   2. Switch to using the returned occurrence
+            #   3. THEN set transform on the new reference
+            # Setting transform before move caused the Garmin to land at its raw
+            # STEP bbox position (sheet's upper-right corner, ~(180, 126)mm).
+            target_occ = new_occ
+            if parent_occ is not None:
+                try:
+                    result = new_occ.moveToComponent(parent_occ)
+                    if isinstance(result, adsk.fusion.Occurrence):
+                        target_occ = result
+                        _log(f"garmin deferred: moved into '{parent_occ.name}', using returned occurrence for transform")
+                    else:
+                        _log(f"garmin deferred: moveToComponent returned unexpected type "
+                             f"({type(result).__name__}); using original reference")
+                except Exception as e:
+                    _log(f"garmin deferred: moveToComponent failed: {e}")
+            else:
+                _log("garmin deferred: no Lightbox_* occurrence at root; leaving connector at root")
+
+            # Apply rotation + translation. Parent (Lightbox_*) has identity
+            # transform, so these values are interpreted identically in parent
+            # local and world coords — no math change needed.
+            mat = adsk.core.Matrix3D.create()
+            mat.setToRotation(-math.pi / 2.0,
+                              adsk.core.Vector3D.create(1, 0, 0),
+                              adsk.core.Point3D.create(0, 0, 0))
+            mat.translation = adsk.core.Vector3D.create(Tx, Ty, Tz)
+            try:
+                target_occ.transform = mat
+                _log(f"garmin deferred: applied transform to '{target_occ.name}'; "
+                     f"center ({(Tx+src_cx)*10:.1f},{(Ty+src_cz)*10:.1f},"
+                     f"{(Tz-src_max_y)*10:.1f}..{(Tz-bb.minPoint.y)*10:.1f})mm")
+            except Exception as e:
+                _log(f"garmin deferred: setting transform on target_occ failed: {e}")
+
+            try:
+                if design.snapshots.hasPendingSnapshot:
+                    design.snapshots.add()
+            except Exception:
+                pass
+        except Exception:
+            _log(f"garmin deferred handler failed:\n{traceback.format_exc()}")
 
 
 class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
@@ -177,6 +391,81 @@ class CommandCreatedHandler(adsk.core.CommandCreatedEventHandler):
                 _vi(s, "endcap_clr", "0.4 mm"))
             g_cap.children.addValueInput("endcap_corner_r", "Outer Corner Fillet Radius (mm, 0 = sharp)", "mm",
                 _vi(s, "endcap_corner_r", "1.5 mm"))
+
+            g_switch = inputs.addGroupCommandInput("g_switch", "Switch Boss + Hole (one end cap)")
+            g_switch.children.addBoolValueInput("switch_hole", "Add Switch Mounting Boss", True, "",
+                s.get("switch_hole", False))
+            g_switch.children.addValueInput("switch_boss_d", "Boss Diameter", "mm",
+                _vi(s, "switch_boss_d", "15 mm"))
+            g_switch.children.addValueInput("switch_boss_h", "Boss Height (inward)", "mm",
+                _vi(s, "switch_boss_h", "5 mm"))
+            g_switch.children.addValueInput("switch_hole_d", "Through-hole Diameter (clearance)", "mm",
+                _vi(s, "switch_hole_d", "6.5 mm"))
+            g_switch.children.addBoolValueInput("switch_tap_thread",
+                "Tap 1/4-40 UNS-2B Internal Thread (overrides Ø, uses 5.7mm tap drill)", True, "",
+                s.get("switch_tap_thread", False))
+
+            g_cutouts = inputs.addGroupCommandInput("g_cutouts", "End Cap Cutouts (plain hole / USB-C)")
+            g_cutouts.children.addBoolValueInput("cap1_plain_hole",
+                "Cap 1: Plain Through-Hole (alternative to switch boss)", True, "",
+                s.get("cap1_plain_hole", False))
+            g_cutouts.children.addValueInput("cap1_plain_hole_d", "Plain Hole Diameter", "mm",
+                _vi(s, "cap1_plain_hole_d", "8.1 mm"))
+            g_cutouts.children.addBoolValueInput("cap2_usbc_port",
+                "Cap 2: USB-C Port Cutout", True, "",
+                s.get("cap2_usbc_port", False))
+            g_cutouts.children.addValueInput("cap2_usbc_w", "USB-C Cutout Width", "mm",
+                _vi(s, "cap2_usbc_w", "8.9 mm"))
+            g_cutouts.children.addValueInput("cap2_usbc_h", "USB-C Cutout Height", "mm",
+                _vi(s, "cap2_usbc_h", "3.3 mm"))
+            g_cutouts.children.addValueInput("cap2_usbc_r", "USB-C Corner Radius", "mm",
+                _vi(s, "cap2_usbc_r", "1.65 mm"))
+            g_cutouts.children.addValueInput("cap2_usbc_y_off", "USB-C Vertical Offset (−down, +up)", "mm",
+                _vi(s, "cap2_usbc_y_off", "0 mm"))
+            g_cutouts.children.addBoolValueInput("cap2_pcb_slot",
+                "Cap 2: PCB Slot (blind pocket on inner face, below USB-C)", True, "",
+                s.get("cap2_pcb_slot", False))
+            g_cutouts.children.addValueInput("cap2_pcb_slot_w", "PCB Slot Width", "mm",
+                _vi(s, "cap2_pcb_slot_w", "17.5 mm"))
+            g_cutouts.children.addValueInput("cap2_pcb_slot_h", "PCB Slot Height (PCB thickness)", "mm",
+                _vi(s, "cap2_pcb_slot_h", "1.2 mm"))
+            g_cutouts.children.addValueInput("cap2_pcb_slot_d", "PCB Slot Depth (into cap)", "mm",
+                _vi(s, "cap2_pcb_slot_d", "2 mm"))
+            g_cutouts.children.addValueInput("cap2_pcb_slot_gap", "Gap below USB-C (slot top to USB-C bottom)", "mm",
+                _vi(s, "cap2_pcb_slot_gap", "0 mm"))
+
+            g_mount = inputs.addGroupCommandInput("g_mount", "Bottom Mount Holes (cross pattern)")
+            g_mount.children.addBoolValueInput("mount_holes", "Add 4-hole Mount Pattern", True, "",
+                s.get("mount_holes", False))
+            g_mount.children.addValueInput("mount_hole_d", "Hole Diameter (clearance)", "mm",
+                _vi(s, "mount_hole_d", "3.0 mm"))
+            g_mount.children.addValueInput("mount_spacing", "Cross Spacing (opposite-hole distance)", "mm",
+                _vi(s, "mount_spacing", "18 mm"))
+            mount_style_dd = g_mount.children.addDropDownCommandInput(
+                "mount_style", "Fixation Style",
+                adsk.core.DropDownStyles.TextListDropDownStyle,
+            )
+            _MOUNT_STYLES = [
+                "Clearance only",
+                "Tap M3 Thread",
+                "Hex Nut Pocket",
+                "Garmin Quarter-Turn Connector",
+            ]
+            sel_mount_style = s.get("mount_style", "Clearance only")
+            if sel_mount_style not in _MOUNT_STYLES:
+                sel_mount_style = "Clearance only"
+            for ms in _MOUNT_STYLES:
+                mount_style_dd.listItems.add(ms, ms == sel_mount_style)
+            g_mount.children.addValueInput("mount_pad_t", "Inner Pad Thickness (for thread / nut)", "mm",
+                _vi(s, "mount_pad_t", "4 mm"))
+
+            g_tab = inputs.addGroupCommandInput("g_tab", "Bottom Seam Tab")
+            g_tab.children.addBoolValueInput("seam_tab", "Add Seam Tab (folds up against back panel)", True, "",
+                s.get("seam_tab", False))
+            g_tab.children.addValueInput("seam_tab_h", "Tab Height", "mm",
+                _vi(s, "seam_tab_h", "4 mm"))
+            g_tab.children.addValueInput("seam_tab_t", "Tab Thickness", "mm",
+                _vi(s, "seam_tab_t", "0.3 mm"))
 
             g_appr = inputs.addGroupCommandInput("g_appr", "Appearance (color / material)")
             g_appr.children.addBoolValueInput("auto_appearance", "Auto-apply Appearance", True, "",
@@ -371,6 +660,31 @@ class CommandExecuteHandler(adsk.core.CommandEventHandler):
                 "endcap_recess": _item(inp, "endcap_recess").value,
                 "endcap_clr":    _item(inp, "endcap_clr").value,
                 "endcap_corner_r": _item(inp, "endcap_corner_r").value,
+                "switch_hole":     _item(inp, "switch_hole").value,
+                "switch_boss_d":   _item(inp, "switch_boss_d").value,
+                "switch_boss_h":   _item(inp, "switch_boss_h").value,
+                "switch_hole_d":   _item(inp, "switch_hole_d").value,
+                "switch_tap_thread": _item(inp, "switch_tap_thread").value,
+                "cap1_plain_hole":   _item(inp, "cap1_plain_hole").value,
+                "cap1_plain_hole_d": _item(inp, "cap1_plain_hole_d").value,
+                "cap2_usbc_port":    _item(inp, "cap2_usbc_port").value,
+                "cap2_usbc_w":       _item(inp, "cap2_usbc_w").value,
+                "cap2_usbc_h":       _item(inp, "cap2_usbc_h").value,
+                "cap2_usbc_r":       _item(inp, "cap2_usbc_r").value,
+                "cap2_usbc_y_off":   _item(inp, "cap2_usbc_y_off").value,
+                "cap2_pcb_slot":     _item(inp, "cap2_pcb_slot").value,
+                "cap2_pcb_slot_w":   _item(inp, "cap2_pcb_slot_w").value,
+                "cap2_pcb_slot_h":   _item(inp, "cap2_pcb_slot_h").value,
+                "cap2_pcb_slot_d":   _item(inp, "cap2_pcb_slot_d").value,
+                "cap2_pcb_slot_gap": _item(inp, "cap2_pcb_slot_gap").value,
+                "mount_holes":     _item(inp, "mount_holes").value,
+                "mount_hole_d":    _item(inp, "mount_hole_d").value,
+                "mount_spacing":   _item(inp, "mount_spacing").value,
+                "mount_style":     _item(inp, "mount_style").selectedItem.name,
+                "mount_pad_t":     _item(inp, "mount_pad_t").value,
+                "seam_tab":        _item(inp, "seam_tab").value,
+                "seam_tab_h":      _item(inp, "seam_tab_h").value,
+                "seam_tab_t":      _item(inp, "seam_tab_t").value,
                 "auto_appearance": _item(inp, "auto_appearance").value,
                 "body_color":      _item(inp, "body_color").selectedItem.name,
                 "text_color":      _item(inp, "text_color").selectedItem.name,
@@ -421,7 +735,28 @@ def cumulative_panel_ranges(panels):
 def build_lightbox(design, p):
     root = design.rootComponent
 
-    parent_occ = root.occurrences.addNewComponent(adsk.core.Matrix3D.create())
+    # This add-in needs to create multiple sub-components (FlatSheet, EndCaps,
+    # GarminMount, …). A Part Design document only allows ONE component, so
+    # detect that case up-front and give the user a clear fix instead of a
+    # raw Fusion exception.
+    try:
+        parent_occ = root.occurrences.addNewComponent(adsk.core.Matrix3D.create())
+    except RuntimeError as e:
+        if "Part Design" in str(e) or "only contain one component" in str(e):
+            msg = (
+                "Foldable Lightbox needs an Assembly document (supports multiple components).\n"
+                "The active document is a Part Design, which can hold only one component.\n\n"
+                "Fix: File → New Design from File → New Design (Assembly), or use the\n"
+                "Design workspace's 'New Assembly' command, then re-run this add-in."
+            )
+            _log("build_lightbox: aborted — Part Design document detected")
+            try:
+                if _ui:
+                    _ui.messageBox(msg, "Foldable Lightbox — Wrong Document Type")
+            except Exception:
+                pass
+            return
+        raise
     parent = parent_occ.component
     parent.name = f"Lightbox_{p['profile']}"
 
@@ -455,23 +790,37 @@ def build_lightbox(design, p):
                 depth = need
 
     panel_ranges = cumulative_panel_ranges(panels)
+    tab_h = p["seam_tab_h"] if p.get("seam_tab") else 0.0
+    tab_t = p.get("seam_tab_t", 0.0) if p.get("seam_tab") else 0.0
 
-    _log(f"profile={p['profile']} panels={[(n, round(w, 3)) for n, w in panels]} depth={depth}")
+    _log(f"profile={p['profile']} panels={[(n, round(w, 3)) for n, w in panels]} depth={depth} tab_h={tab_h} tab_t={tab_t}")
 
-    sheet_body = build_flat_sheet(sheet_comp, panels, depth, t)
+    sheet_body = build_flat_sheet(sheet_comp, panels, depth, t, tab_h)
 
     top_plane = _offset_plane(sheet_comp, sheet_comp.xYConstructionPlane, t, "top_sketch_plane")
-    add_hinge_grooves(sheet_comp, top_plane, panel_ranges, depth, t, p)
+    if tab_h > 0 and tab_t > 0 and tab_t < t - 1e-5:
+        thin_seam_tab(sheet_comp, top_plane, depth, tab_h, t, tab_t)
+    add_hinge_grooves(sheet_comp, top_plane, panel_ranges, depth, t, p, tab_h, tab_t)
 
     if p["text_str"] and p["text_h"] > 0:
         add_text_bodies(sheet_comp, top_plane, panel_ranges, depth, t, p)
+
+    if p.get("mount_holes"):
+        if p.get("mount_style") == "Garmin Quarter-Turn Connector":
+            # Garmin mode: no drilled holes / pad / nuts — the connector body
+            # is the entire fixation and sits flush on the base panel bottom.
+            # Pass parent_occ (not parent) so we can grab a root-rooted proxy
+            # of the new GarminMount occurrence — required for entityToken.
+            add_garmin_mount(parent_occ, panel_ranges, depth, t)
+        else:
+            add_mount_holes(sheet_comp, top_plane, panel_ranges, depth, t, p)
 
     if p["endcaps"]:
         total_len = sum(w for _, w in panels)
         thin_depth = p["endcap_ring_w"] + p["endcap_clr"]
         thin_sheet_ends(sheet_comp, top_plane, depth, total_len, t,
-                        thin_depth, p["endcap_recess"])
-        build_end_caps(parent, panels, depth, t, p)
+                        thin_depth, p["endcap_recess"], tab_h)
+        build_end_caps(parent, panels, depth, t, p, tab_h)
 
     if p.get("auto_appearance"):
         apply_appearances(design, parent, p["body_color"], p["text_color"])
@@ -612,12 +961,12 @@ def _activate_component(target):
     return walk(design.rootComponent)
 
 
-def build_flat_sheet(comp, panels, depth, thickness):
+def build_flat_sheet(comp, panels, depth, thickness, tab_h=0.0):
     sk = comp.sketches.add(comp.xYConstructionPlane)
     sk.name = "flat_sheet_outline"
     total_len = sum(w for _, w in panels)
     sk.sketchCurves.sketchLines.addTwoPointRectangle(
-        adsk.core.Point3D.create(0, 0, 0),
+        adsk.core.Point3D.create(0, -tab_h, 0),
         adsk.core.Point3D.create(depth, total_len, 0)
     )
 
@@ -647,7 +996,30 @@ def _largest_profile(sketch):
     return best
 
 
-def add_hinge_grooves(comp, top_plane, panel_ranges, depth, t, p):
+def thin_seam_tab(comp, top_plane, depth, tab_h, t, tab_t):
+    """Rabbet the tab region (Y < 0) from the top face so the tab is only
+    `tab_t` thick instead of full sheet thickness `t`. The step at Y=0 acts
+    as a living hinge between tab and base."""
+    thin_by = t - tab_t
+    if thin_by <= 1e-5 or tab_h <= 0:
+        return
+    sk = comp.sketches.add(top_plane)
+    sk.name = "tab_thin"
+    sk.sketchCurves.sketchLines.addTwoPointRectangle(
+        adsk.core.Point3D.create(-0.01, -tab_h - 0.01, 0),
+        adsk.core.Point3D.create(depth + 0.01, 0, 0),
+    )
+    prof = _largest_profile(sk)
+    if not prof:
+        return
+    ext_in = comp.features.extrudeFeatures.createInput(
+        prof, adsk.fusion.FeatureOperations.CutFeatureOperation
+    )
+    ext_in.setDistanceExtent(False, adsk.core.ValueInput.createByReal(-thin_by))
+    comp.features.extrudeFeatures.add(ext_in)
+
+
+def add_hinge_grooves(comp, top_plane, panel_ranges, depth, t, p, tab_h=0.0, tab_t=0.0):
     hw = p["hinge_w"]
     ht = p["hinge_t"]
     groove_depth = t - ht
@@ -656,6 +1028,11 @@ def add_hinge_grooves(comp, top_plane, panel_ranges, depth, t, p):
 
     panel_list = list(panel_ranges.items())
     hinge_ys = [panel_list[i][1][1] for i in range(len(panel_list) - 1)]
+    # If the seam tab is already thinned to ≤ sheet thickness it acts as its
+    # own living hinge at Y=0, so no explicit groove is needed there.
+    tab_full_t = tab_h > 0 and (tab_t <= 0 or tab_t >= t - 1e-5)
+    if tab_full_t:
+        hinge_ys = [0.0] + hinge_ys
 
     for i, hy in enumerate(hinge_ys):
         sk = comp.sketches.add(top_plane)
@@ -676,7 +1053,7 @@ def add_hinge_grooves(comp, top_plane, panel_ranges, depth, t, p):
         comp.features.extrudeFeatures.add(ext_in)
 
 
-def thin_sheet_ends(comp, top_plane, depth, total_len, t, thin_depth, recess_d):
+def thin_sheet_ends(comp, top_plane, depth, total_len, t, thin_depth, recess_d, tab_h=0.0):
     """Rabbet the outer face at both axial ends by `thin_depth` over a band of
     length `recess_d`. The end cap's outer ring (ring_w) fills this step and its
     clearance (clr) accounts for pocket fit — so thin_depth = ring_w + clr is
@@ -698,7 +1075,7 @@ def thin_sheet_ends(comp, top_plane, depth, total_len, t, thin_depth, recess_d):
         sk = comp.sketches.add(top_plane)
         sk.name = f"thin_band_{tag}"
         sk.sketchCurves.sketchLines.addTwoPointRectangle(
-            adsk.core.Point3D.create(x0, 0, 0),
+            adsk.core.Point3D.create(x0, -tab_h, 0),
             adsk.core.Point3D.create(x1, total_len, 0),
         )
         prof = _largest_profile(sk)
@@ -710,6 +1087,224 @@ def thin_sheet_ends(comp, top_plane, depth, total_len, t, thin_depth, recess_d):
         ext_in.setDistanceExtent(False, adsk.core.ValueInput.createByReal(-thin_depth))
         comp.features.extrudeFeatures.add(ext_in)
     _log(f"thin_sheet_ends: band={recess_d*10:.2f}mm depth={thin_depth*10:.2f}mm")
+
+
+def add_mount_holes(comp, top_plane, panel_ranges, depth, t, p):
+    """Drill clearance holes through 'base' panel in a cross pattern.
+    Optionally add an inner pad + tapped thread or hex nut pocket."""
+    base = panel_ranges.get("base")
+    if not base:
+        _log("mount holes: no base panel; skipping")
+        return
+    y_min, y_max, y_mid = base
+    x_mid = depth / 2.0
+    user_r = p["mount_hole_d"] / 2.0
+    half = p["mount_spacing"] / 2.0
+    style = p.get("mount_style", "Clearance only")
+    pad_t = p.get("mount_pad_t", 0.4) if style != "Clearance only" else 0.0
+
+    panel_half_y = (y_max - y_min) / 2.0
+    x_fits = (half + user_r) <= depth / 2.0
+    y_fits = (half + user_r) <= panel_half_y
+
+    if not x_fits and not y_fits:
+        min_needed_mm = (p["mount_spacing"] + p["mount_hole_d"]) * 10
+        msg = (
+            f"Mount holes skipped: base panel ({(y_max-y_min)*10:.1f}×{depth*10:.1f}mm) "
+            f"too small for spacing {p['mount_spacing']*10:.1f}mm + Ø{p['mount_hole_d']*10:.1f}mm clearance. "
+            f"Need at least one side ≥ {min_needed_mm:.1f}mm. Increase Bottom Width / Depth or reduce spacing."
+        )
+        _log(msg)
+        try:
+            if _ui:
+                _ui.messageBox(msg, "Foldable Lightbox — Mount Holes")
+        except Exception:
+            pass
+        return
+
+    centers = []
+    if x_fits:
+        centers += [(x_mid + half, y_mid), (x_mid - half, y_mid)]
+    if y_fits:
+        centers += [(x_mid, y_mid + half), (x_mid, y_mid - half)]
+
+    sheet_body = comp.bRepBodies.itemByName("Sheet")
+
+    # ── Build inner pad (Join to Sheet) ──
+    if pad_t > 0 and sheet_body:
+        margin = 0.2  # cm
+        xs = [c[0] for c in centers]
+        ys = [c[1] for c in centers]
+        px0 = max(0, min(xs) - user_r - margin)
+        px1 = min(depth, max(xs) + user_r + margin)
+        py0 = max(y_min, min(ys) - user_r - margin)
+        py1 = min(y_max, max(ys) + user_r + margin)
+        sk_pad = comp.sketches.add(top_plane)
+        sk_pad.name = "mount_pad"
+        sk_pad.sketchCurves.sketchLines.addTwoPointRectangle(
+            adsk.core.Point3D.create(px0, py0, 0),
+            adsk.core.Point3D.create(px1, py1, 0),
+        )
+        prof_pad = _largest_profile(sk_pad)
+        if prof_pad:
+            ext_in = comp.features.extrudeFeatures.createInput(
+                prof_pad, adsk.fusion.FeatureOperations.JoinFeatureOperation)
+            ext_in.setDistanceExtent(False, adsk.core.ValueInput.createByReal(pad_t))
+            try:
+                ext_in.participantBodies = [sheet_body]
+            except Exception:
+                coll = adsk.core.ObjectCollection.create()
+                coll.add(sheet_body)
+                ext_in.participantBodies = coll
+            comp.features.extrudeFeatures.add(ext_in)
+
+    # ── Drill clearance / tap-drill holes through sheet + pad ──
+    # For M3 thread, hole ø must be the tap drill (2.5mm for M3x0.5), not user clearance.
+    cut_r = 0.125 if style == "Tap M3 Thread" else user_r
+    if pad_t > 0:
+        drill_plane = _offset_plane(comp, comp.xYConstructionPlane, t + pad_t,
+                                    "mount_drill_plane")
+    else:
+        drill_plane = top_plane
+    total_depth = t + pad_t
+
+    sk_h = comp.sketches.add(drill_plane)
+    sk_h.name = "mount_holes"
+    for cx, cy in centers:
+        sk_h.sketchCurves.sketchCircles.addByCenterRadius(
+            adsk.core.Point3D.create(cx, cy, 0), cut_r)
+
+    cut_feats = []
+    for i in range(sk_h.profiles.count):
+        prof = sk_h.profiles.item(i)
+        ext_in = comp.features.extrudeFeatures.createInput(
+            prof, adsk.fusion.FeatureOperations.CutFeatureOperation
+        )
+        ext_in.setDistanceExtent(False, adsk.core.ValueInput.createByReal(-total_depth))
+        cut_feats.append(comp.features.extrudeFeatures.add(ext_in))
+
+    # ── Apply M3×0.5 internal thread on each hole ──
+    if style == "Tap M3 Thread":
+        tf = comp.features.threadFeatures
+        ti = tf.createThreadInfo(True, "ISO Metric profile", "M3x0.5", "6H")
+        for cf in cut_feats:
+            cyl = next((f for f in cf.sideFaces if isinstance(f.geometry, adsk.core.Cylinder)), None)
+            if not cyl:
+                continue
+            face_coll = adsk.core.ObjectCollection.create()
+            face_coll.add(cyl)
+            t_in = tf.createInput(face_coll, ti)
+            t_in.isModeled = True
+            try:
+                tf.add(t_in)
+            except Exception as e:
+                _log(f"mount hole M3 thread fail: {e}")
+
+    # ── Cut hex nut pockets from sheet BOTTOM (Z=0) upward into the pad.
+    # Opening on sheet bottom face → after folding this faces box INSIDE, so nut
+    # drops in from inside the box; screw threads in from outside (through pad).
+    # Trade-off: hex ceiling is an overhang when printing flat → needs support.
+    if style == "Hex Nut Pocket":
+        aflat = 0.55    # M3 DIN 934 across-flats 5.5mm
+        nut_d = 0.26    # pocket depth 2.6mm (nut 2.4mm + 0.2mm clearance)
+        r_hex = aflat / (2 * math.cos(math.radians(30)))
+        sk_hex = comp.sketches.add(comp.xYConstructionPlane)
+        sk_hex.name = "mount_hex_pockets"
+        for cx, cy in centers:
+            pts = [
+                (cx + r_hex * math.cos(math.radians(30 + 60*i)),
+                 cy + r_hex * math.sin(math.radians(30 + 60*i)))
+                for i in range(6)
+            ]
+            for i in range(6):
+                sk_hex.sketchCurves.sketchLines.addByTwoPoints(
+                    adsk.core.Point3D.create(pts[i][0], pts[i][1], 0),
+                    adsk.core.Point3D.create(pts[(i+1) % 6][0], pts[(i+1) % 6][1], 0),
+                )
+        for i in range(sk_hex.profiles.count):
+            prof = sk_hex.profiles.item(i)
+            ext_in = comp.features.extrudeFeatures.createInput(
+                prof, adsk.fusion.FeatureOperations.CutFeatureOperation)
+            ext_in.setDistanceExtent(False, adsk.core.ValueInput.createByReal(nut_d))
+            comp.features.extrudeFeatures.add(ext_in)
+
+    n = len(centers)
+    axis = "cross" if n == 4 else ("depth" if x_fits else "width")
+    _log(f"mount holes: {n}x {style}, spacing={p['mount_spacing']*10:.1f}mm, pad={pad_t*10:.1f}mm, axis={axis}")
+
+
+def add_garmin_mount(parent_occ, panel_ranges, depth, t):
+    """Queue a deferred Garmin connector STEP import + placement.
+
+    Fusion's importManager.importToTarget must NOT be called inside a command
+    event (it can crash Fusion). Observed actual behaviour: for a STEP file
+    it always creates a *new root-level occurrence* linking to an auto-
+    imported child document — regardless of the `target` component passed
+    in — and auto-rotates the body from STEP Y-up to Fusion Z-up.
+
+    So here we just record the intent (including sheet geometry needed to
+    centre the body on the base panel) and fire a custom event. The paired
+    GarminImportHandler runs AFTER onExecute returns, imports the STEP at
+    root, finds the newly-created occurrence, and sets its transform to
+    land the body on the base panel's bottom face (Z=0) centred at
+    (depth/2, base_y_mid).
+    """
+    base = panel_ranges.get("base")
+    if not base:
+        _log("garmin mount: no base panel; skipping")
+        return
+    _, _, base_y_mid = base
+
+    step_path = os.path.join(os.path.dirname(__file__), "garmin_connector_male.step")
+    if not os.path.exists(step_path):
+        msg = (f"Garmin connector STEP file missing at\n  {step_path}\n\n"
+               "Skipping Garmin mount. Ship the STEP file alongside the add-in "
+               "to enable this feature.")
+        _log(f"garmin mount: STEP missing at {step_path}; skipping")
+        try:
+            if _ui:
+                _ui.messageBox(msg, "Foldable Lightbox — Garmin Mount")
+        except Exception:
+            pass
+        return
+
+    # Snapshot current root occurrences — the handler will diff against this
+    # to detect the newly-imported occurrence.
+    try:
+        design = adsk.core.Application.get().activeProduct
+        root = design.rootComponent
+        pre_names = {root.occurrences.item(i).name for i in range(root.occurrences.count)}
+    except Exception as e:
+        _log(f"garmin mount: failed to snapshot root occurrences: {e}")
+        pre_names = set()
+
+    # Capture the Lightbox parent occurrence's entityToken so the deferred
+    # handler can resolve it post-import and nest the Garmin connector inside
+    # the Lightbox group instead of leaving it at root.
+    parent_token = ""
+    try:
+        parent_token = parent_occ.entityToken or ""
+    except Exception as e:
+        _log(f"garmin mount: failed to capture parent entityToken: {e}")
+
+    params = {
+        "step_path": step_path,
+        "depth_cm": depth,
+        "base_y_mid_cm": base_y_mid,
+        "sheet_t_cm": t,
+        "pre_names": list(pre_names),
+        "parent_token": parent_token,
+    }
+    _pending_garmin_imports.append(params)
+
+    try:
+        app = adsk.core.Application.get()
+        fired = app.fireCustomEvent(GARMIN_IMPORT_EVENT_ID, "")
+        _log(f"garmin mount: enqueued import depth={depth*10:.1f}mm "
+             f"base_y_mid={base_y_mid*10:.1f}mm t={t*10:.2f}mm, "
+             f"pre_occ_count={len(pre_names)}, fireCustomEvent={fired}")
+    except Exception as e:
+        _log(f"garmin mount: failed to fire event: {e}\n{traceback.format_exc()}")
 
 
 def _apply_text_style(text_input, p):
@@ -756,8 +1351,10 @@ def _measure_text(comp, top_plane, text, th, p):
 def _fit_text_height(comp, top_plane, text, requested_th, avail_x, avail_y, min_th, p):
     """Return the largest text height ≤ requested_th that keeps the rendered text inside
     (avail_x, avail_y). Measures iteratively because different fonts / glyph spacing can
-    shift the effective aspect ratio."""
-    SAFETY = 0.94
+    shift the effective aspect ratio.
+    SAFETY = 0.97 leaves a 3% buffer for measurement-vs-layout variance; tighter than
+    0.94 so text fills more of the panel when autosize-depth is on."""
+    SAFETY = 0.97
     target_w = avail_x * SAFETY
     target_h = avail_y * SAFETY
 
@@ -785,17 +1382,24 @@ def _fit_text_height(comp, top_plane, text, requested_th, avail_x, avail_y, min_
 
 def _autosize_depth(comp, plane, p):
     """Measure front + back text at requested height, return the minimum depth that
-    comfortably fits whichever is longer (text + 8% margin each side)."""
+    comfortably fits whichever is longer. The divisor combines the full margin chain
+    that add_text_bodies + _fit_text_height will apply downstream so autofit doesn't
+    shrink the text further once the depth is sized:
+      avail_x = depth * (1 - 2*MARGIN_X_FRAC)   where MARGIN_X_FRAC = 0.04
+      target_w = avail_x * SAFETY               where SAFETY = 0.97 in _fit_text_height
+    → depth_needed = w / (0.92 * 0.97) ≈ w / 0.8924
+    """
     front = p["text_str"]
     back = (p.get("text_str_back") or "").strip() or front
     th = p["text_h"]
     if not front or th <= 0:
         return p["depth"]
     needed = 0.0
+    usable_frac = 0.92 * 0.97  # keep in sync with add_text_bodies margin + _fit_text_height SAFETY
     for text in {front, back}:
         w, _ = _measure_text(comp, plane, text, th, p)
         if w > 0:
-            needed = max(needed, w / 0.84)
+            needed = max(needed, w / usable_frac)
     if needed <= 0:
         return p["depth"]
     _log(f"autosize depth: longer of {{'{front}','{back}'}} at {th*10:.1f}mm -> depth={needed*10:.1f}mm")
@@ -856,7 +1460,9 @@ def add_text_bodies(comp, top_plane, panel_ranges, depth, t, p):
     front_len = fy1 - fy0
     back_len = by1 - by0
 
-    margin_x = depth * 0.08
+    # Margin fractions kept tight so text fills most of the panel (user feedback:
+    # "上下左右還有空間"). Keep in sync with _autosize_depth's usable_frac.
+    margin_x = depth * 0.04
     x0 = margin_x
     x1 = depth - margin_x
     avail_x = x1 - x0
@@ -866,7 +1472,7 @@ def add_text_bodies(comp, top_plane, panel_ranges, depth, t, p):
     # is longer drives the final size, the shorter one inherits it and centers.
     MIN_TH = 0.1  # 1 mm floor
     if p.get("text_autofit", True):
-        avail_y = min(front_len, back_len) * 0.76
+        avail_y = min(front_len, back_len) * 0.88
         th_f = _fit_text_height(comp, top_plane, front_text, th, avail_x, avail_y, MIN_TH, p)
         th_b = th_f if back_text == front_text \
             else _fit_text_height(comp, top_plane, back_text, th, avail_x, avail_y, MIN_TH, p)
@@ -874,7 +1480,7 @@ def add_text_bodies(comp, top_plane, panel_ranges, depth, t, p):
 
     def _panel_y_range(y_lo, y_hi):
         plen = y_hi - y_lo
-        margin_y = min(plen * 0.12, th * 0.4)
+        margin_y = min(plen * 0.06, th * 0.25)
         return y_lo + margin_y, y_hi - margin_y
 
     fy0_t, fy1_t = _panel_y_range(fy0, fy1)
@@ -935,8 +1541,11 @@ def add_text_bodies(comp, top_plane, panel_ranges, depth, t, p):
     except Exception as e:
         _log(f"front text body failed: {e}")
         return
+    all_text_bodies = []
     for i in range(body_feat.bodies.count):
-        body_feat.bodies.item(i).name = f"Text_front_{i + 1}"
+        b = body_feat.bodies.item(i)
+        b.name = f"Text_front_{i + 1}"
+        all_text_bodies.append(b)
 
     # --- Back: extrude on back panel then rotate 180° about Z through back center so
     # the glyphs read correctly on the opposite face of the folded box. ---
@@ -956,6 +1565,7 @@ def add_text_bodies(comp, top_plane, panel_ranges, depth, t, p):
         b = back_body_feat.bodies.item(i)
         b.name = f"Text_back_{i + 1}"
         back_text_bodies.add(b)
+        all_text_bodies.append(b)
 
     rot = adsk.core.Matrix3D.create()
     rot.setToRotation(
@@ -991,15 +1601,27 @@ def add_text_bodies(comp, top_plane, panel_ranges, depth, t, p):
         _normalize_sheet_names(comp)
 
     # Move all text bodies into a "Text" sub-component so user can set material per group.
+    # Use the direct refs we captured at extrude time — comp.bRepBodies sometimes
+    # returns proxies that moveToComponent rejects, leaving bodies in the parent.
     text_occ = comp.occurrences.addNewComponent(adsk.core.Matrix3D.create())
     text_occ.component.name = "Text"
 
-    all_text = [b for b in comp.bRepBodies if b.name.startswith("Text_")]
-    for b in all_text:
+    moved = 0
+    for b in all_text_bodies:
         try:
             b.moveToComponent(text_occ)
+            moved += 1
         except Exception as e:
             _log(f"move {b.name} to Text component failed: {e}")
+    # Fallback: any body still named Text_* in sheet_comp (e.g. islands) goes too.
+    for b in list(comp.bRepBodies):
+        if b.name.startswith("Text_"):
+            try:
+                b.moveToComponent(text_occ)
+                moved += 1
+            except Exception as e:
+                _log(f"move fallback {b.name} failed: {e}")
+    _log(f"text move: {moved}/{len(all_text_bodies)} direct + fallback moved into Text component")
 
 
 def _main_sheet_body(comp):
@@ -1017,14 +1639,24 @@ def _main_sheet_body(comp):
 
 def _normalize_sheet_names(comp):
     """After through-cut text, letters with closed inner regions (A, O, D, P, B, R, Q)
-    leave disconnected material as separate 'Sheet (N)' bodies. We KEEP the islands
-    (they sit flush inside each letter hole and fuse to the main sheet on the first
-    print layer — visually the O's inner disk shows in sheet color).
+    leave disconnected material as separate 'Sheet (N)' bodies. These islands sit
+    inside each letter hole and fuse to the main sheet on the first print layer —
+    visually the letter's inner area shows in sheet color.
 
-    This only ensures the LARGEST body is named "Sheet" so anything keying off that
-    name still works. The smaller bodies keep their auto-generated "Sheet (N)" names;
-    appearance assignment keys off parent component, not body name, so they still
-    get the sheet color."""
+    Caveat: STL export emits the islands as separate connected components.
+    Bambu Studio / PrusaSlicer / Cura auto-split STL by connectivity and will
+    show each island as its own floating object. Workarounds for the user:
+      (1) Export as 3MF instead of STL (preserves per-body grouping in the
+          slicer), or
+      (2) After STL import, use the slicer's "Merge parts" / "Unite" action to
+          combine the islands with the main sheet — they'll still print as
+          intended, with the first layer fusing everything.
+
+    Boolean-joining disjoint bodies inside Fusion is not directly supported
+    by CombineFeature (Fusion errors "Some input argument is invalid") and
+    synthesising a thin bridge is fragile in the parametric timeline, so we
+    leave the islands as separate bodies and only fix up the naming: largest
+    body -> "Sheet" so downstream name-keyed code keeps working."""
     sheets = [b for b in comp.bRepBodies if b.name == "Sheet" or b.name.startswith("Sheet (")]
     if not sheets:
         return
@@ -1039,23 +1671,19 @@ def _normalize_sheet_names(comp):
         except Exception:
             return 0.0
     sheets.sort(key=_vol, reverse=True)
-
-    # Find the largest. If it's not already called "Sheet", swap names with whichever
-    # body currently holds that name (Fusion rejects duplicates, so a direct rename
-    # to "Sheet" would silently no-op when another body already owns it).
     main = sheets[0]
-    if main.name == "Sheet":
-        return
-    current_sheet = next((b for b in sheets if b.name == "Sheet"), None)
-    main_old_name = main.name
-    if current_sheet:
-        current_sheet.name = f"__tmp_{main_old_name}"
-        main.name = "Sheet"
-        # Re-assign a stable auto-style name to the demoted one
-        current_sheet.name = main_old_name
-    else:
-        main.name = "Sheet"
-    _log(f"through-cut: kept {len(sheets)} sheet body/bodies (main + islands)")
+    if main.name != "Sheet":
+        current_sheet = next((b for b in sheets if b.name == "Sheet"), None)
+        main_old_name = main.name
+        if current_sheet is not None and current_sheet is not main:
+            current_sheet.name = f"__tmp_{main_old_name}"
+            main.name = "Sheet"
+            current_sheet.name = main_old_name
+        else:
+            main.name = "Sheet"
+    _log(f"through-cut: {len(sheets)} sheet body/bodies (main + {len(sheets)-1} island"
+         f"{'s' if len(sheets)-1 != 1 else ''}); islands stay as separate bodies — "
+         f"export to 3MF or 'Merge parts' in slicer to treat as one object")
 
 
 def _fillet_cap_corners(cap_comp, plate_body, cap_t, recess_d, corner_r, ring_w):
@@ -1110,7 +1738,279 @@ def _fillet_cap_corners(cap_comp, plate_body, cap_t, recess_d, corner_r, ring_w)
          f"(n_plate={len(plate_vert)}, n_pocket_outer={len(pocket_outer_edges)})")
 
 
-def build_end_caps(parent, panels, depth, t, p):
+def _add_switch_boss_hole(comp, cap_body, y_off, outline, cap_t,
+                          boss_d, boss_h, hole_d, tap_thread=False):
+    """Add cylindrical boss on cap's top (inner) face at profile bbox center,
+    then drill a through-hole (boss + cap). outline is list of (x, z) tuples —
+    z is used as sketch-Y here (matches _draw_loop convention).
+    If tap_thread is True, hole_d is overridden with 5.3mm tap drill and an
+    M6×0.75 internal thread feature is added on the hole face."""
+    if tap_thread:
+        # 1/4-40 UNS-2B internal thread (datasheet: 100SP3T1B1M2QE toggle switch
+        # uses 1/4-40 UNS-2A bushing). Tap drill ≈ major − pitch = 6.35 − 0.635
+        # = 5.715mm; use 5.7mm for a forgiving self-tap fit in FDM plastic.
+        hole_d = 0.57
+    xs = [pt[0] for pt in outline]
+    zs = [pt[1] for pt in outline]
+    cx = (min(xs) + max(xs)) / 2.0
+    cy = (min(zs) + max(zs)) / 2.0 + y_off
+
+    top_plane = _offset_plane(comp, comp.xYConstructionPlane, cap_t,
+                              f"switch_plane_{id(cap_body)}")
+
+    sk_b = comp.sketches.add(top_plane)
+    sk_b.name = "switch_boss_circle"
+    sk_b.sketchCurves.sketchCircles.addByCenterRadius(
+        adsk.core.Point3D.create(cx, cy, 0), boss_d / 2.0)
+    prof_b = _largest_profile(sk_b)
+    if not prof_b:
+        _log("switch boss: no profile")
+        return
+    ext_in = comp.features.extrudeFeatures.createInput(
+        prof_b, adsk.fusion.FeatureOperations.JoinFeatureOperation
+    )
+    ext_in.setDistanceExtent(False, adsk.core.ValueInput.createByReal(boss_h))
+    try:
+        ext_in.participantBodies = [cap_body]
+    except Exception:
+        coll = adsk.core.ObjectCollection.create()
+        coll.add(cap_body)
+        ext_in.participantBodies = coll
+    comp.features.extrudeFeatures.add(ext_in)
+
+    # Hole sketch must sit on the boss's *top* face so a -Z cut passes through
+    # boss + cap in one feature. Using top_plane (Z=cap_t) would miss the boss
+    # because the boss grows in +Z above that plane.
+    hole_plane = _offset_plane(comp, comp.xYConstructionPlane, cap_t + boss_h,
+                               f"switch_hole_plane_{id(cap_body)}")
+    sk_h = comp.sketches.add(hole_plane)
+    sk_h.name = "switch_hole_circle"
+    sk_h.sketchCurves.sketchCircles.addByCenterRadius(
+        adsk.core.Point3D.create(cx, cy, 0), hole_d / 2.0)
+    prof_h = _largest_profile(sk_h)
+    if not prof_h:
+        _log("switch hole: no profile")
+        return
+    cut_in = comp.features.extrudeFeatures.createInput(
+        prof_h, adsk.fusion.FeatureOperations.CutFeatureOperation
+    )
+    cut_in.setDistanceExtent(False, adsk.core.ValueInput.createByReal(-(boss_h + cap_t)))
+    cut_feat = comp.features.extrudeFeatures.add(cut_in)
+
+    if tap_thread:
+        hole_face = None
+        for f in cut_feat.sideFaces:
+            if isinstance(f.geometry, adsk.core.Cylinder):
+                hole_face = f
+                break
+        if hole_face:
+            # Mini toggle switch bushings (e.g. C&K 100SP3T1B1M2QE) use
+            # 1/4-40 UNS-2A external threads — the mating internal thread we
+            # model here is 1/4-40 UNS-2B. Fusion's thread library lists this
+            # under "ANSI Unified Screw Threads"; fall back to "M6x0.75" if the
+            # library designation is unavailable on the user's install.
+            tf = comp.features.threadFeatures
+            attempts = [
+                ("ANSI Unified Screw Threads", "1/4-40 UNS", "2B"),
+                ("ANSI Unified Screw Threads", "1/4-40", "2B"),
+                ("ISO Metric profile", "M6x0.75", "6H"),  # last-resort fallback
+            ]
+            thread_added = False
+            for thread_type, designation, cls in attempts:
+                try:
+                    ti = tf.createThreadInfo(True, thread_type, designation, cls)
+                    face_coll = adsk.core.ObjectCollection.create()
+                    face_coll.add(hole_face)
+                    t_in = tf.createInput(face_coll, ti)
+                    t_in.isModeled = True
+                    tf.add(t_in)
+                    _log(f"switch hole: boss Ø{boss_d*10:.2f}×{boss_h*10:.2f}mm, "
+                         f"{designation} ({thread_type} cls {cls}) tapped Ø{hole_d*10:.2f}mm "
+                         f"through {cap_t*10:.2f}+{boss_h*10:.2f}mm")
+                    thread_added = True
+                    break
+                except Exception as e:
+                    _log(f"switch thread: {thread_type}/{designation}/{cls} failed: {e}")
+            if not thread_added:
+                _log(f"switch thread: all thread designations failed; leaving as plain Ø{hole_d*10:.2f}mm hole")
+            return
+        else:
+            _log(f"switch thread: no cylindrical hole face found; leaving as plain Ø{hole_d*10:.2f}mm hole")
+
+    _log(f"switch hole: boss Ø{boss_d*10:.2f}×{boss_h*10:.2f}mm, hole Ø{hole_d*10:.2f}mm through {cap_t*10:.2f}+{boss_h*10:.2f}mm")
+
+
+def _add_cap_plain_hole(comp, cap_body, y_off, outline, cap_t, hole_d):
+    """Simple Ø through-hole on cap plate, centered in profile bbox. No boss, no thread.
+    Alternative to _add_switch_boss_hole when the user just wants a clean clearance hole
+    (e.g. Ø8.1mm for a cable gland or bushing).
+    Sketches on a plane ABOVE the cap top so the plate outline isn't inherited as a
+    profile — cuts -Z by (cap_t + overshoot) to punch through the full plate."""
+    xs = [pt[0] for pt in outline]
+    zs = [pt[1] for pt in outline]
+    cx = (min(xs) + max(xs)) / 2.0
+    cy = (min(zs) + max(zs)) / 2.0 + y_off
+
+    hole_plane = _offset_plane(comp, comp.xYConstructionPlane, cap_t + 0.1,
+                               f"cap_plain_hole_plane_{id(cap_body)}")
+    sk = comp.sketches.add(hole_plane)
+    sk.name = f"cap_plain_hole_{id(cap_body)}"
+    sk.sketchCurves.sketchCircles.addByCenterRadius(
+        adsk.core.Point3D.create(cx, cy, 0), hole_d / 2.0)
+    prof = _largest_profile(sk)
+    if not prof:
+        _log("cap plain hole: no profile")
+        return
+    cut_in = comp.features.extrudeFeatures.createInput(
+        prof, adsk.fusion.FeatureOperations.CutFeatureOperation
+    )
+    cut_in.setDistanceExtent(False, adsk.core.ValueInput.createByReal(-(cap_t + 0.2)))
+    try:
+        comp.features.extrudeFeatures.add(cut_in)
+        _log(f"cap plain hole: Ø{hole_d*10:.2f}mm through {cap_t*10:.2f}mm plate")
+    except Exception as e:
+        _log(f"cap plain hole failed: {e}")
+
+
+def _add_cap_usbc_cutout(comp, cap_body, y_off, outline, cap_t, w, h, r, y_shift=0.0):
+    """Rounded-rectangle cutout (USB-C port) through cap plate, centered in profile
+    bbox. Width w is along the profile horizontal axis (sketch X), height h is along
+    the vertical axis (sketch Y). y_shift shifts the port along the profile vertical
+    axis (negative = toward bottom). Corner radius r is clamped to min(w/2, h/2) − eps
+    so straight edges keep positive length (at r = h/2 the shape becomes a stadium)."""
+    xs = [pt[0] for pt in outline]
+    zs = [pt[1] for pt in outline]
+    cx = (min(xs) + max(xs)) / 2.0
+    cy = (min(zs) + max(zs)) / 2.0 + y_off + y_shift
+
+    eps = 1e-3  # 10 µm, keeps degenerate edges non-zero for Fusion
+    r = max(0.0, min(r, w / 2.0 - eps, h / 2.0 - eps))
+
+    hole_plane = _offset_plane(comp, comp.xYConstructionPlane, cap_t + 0.1,
+                               f"cap_usbc_plane_{id(cap_body)}")
+    sk = comp.sketches.add(hole_plane)
+    sk.name = f"cap_usbc_cutout_{id(cap_body)}"
+
+    hw = w / 2.0
+    hh = h / 2.0
+    lines = sk.sketchCurves.sketchLines
+    arcs = sk.sketchCurves.sketchArcs
+
+    if r < 1e-4:
+        lines.addTwoPointRectangle(
+            adsk.core.Point3D.create(cx - hw, cy - hh, 0),
+            adsk.core.Point3D.create(cx + hw, cy + hh, 0),
+        )
+    else:
+        # 4 straight edges (shortened by r at each end)
+        lines.addByTwoPoints(
+            adsk.core.Point3D.create(cx - hw + r, cy + hh, 0),
+            adsk.core.Point3D.create(cx + hw - r, cy + hh, 0),
+        )
+        lines.addByTwoPoints(
+            adsk.core.Point3D.create(cx - hw + r, cy - hh, 0),
+            adsk.core.Point3D.create(cx + hw - r, cy - hh, 0),
+        )
+        lines.addByTwoPoints(
+            adsk.core.Point3D.create(cx - hw, cy - hh + r, 0),
+            adsk.core.Point3D.create(cx - hw, cy + hh - r, 0),
+        )
+        lines.addByTwoPoints(
+            adsk.core.Point3D.create(cx + hw, cy - hh + r, 0),
+            adsk.core.Point3D.create(cx + hw, cy + hh - r, 0),
+        )
+        # 4 corner arcs (+90° CCW sweep from each start)
+        # TR: east → north
+        arcs.addByCenterStartSweep(
+            adsk.core.Point3D.create(cx + hw - r, cy + hh - r, 0),
+            adsk.core.Point3D.create(cx + hw, cy + hh - r, 0),
+            math.pi / 2.0,
+        )
+        # TL: north → west
+        arcs.addByCenterStartSweep(
+            adsk.core.Point3D.create(cx - hw + r, cy + hh - r, 0),
+            adsk.core.Point3D.create(cx - hw + r, cy + hh, 0),
+            math.pi / 2.0,
+        )
+        # BL: west → south
+        arcs.addByCenterStartSweep(
+            adsk.core.Point3D.create(cx - hw + r, cy - hh + r, 0),
+            adsk.core.Point3D.create(cx - hw, cy - hh + r, 0),
+            math.pi / 2.0,
+        )
+        # BR: south → east
+        arcs.addByCenterStartSweep(
+            adsk.core.Point3D.create(cx + hw - r, cy - hh + r, 0),
+            adsk.core.Point3D.create(cx + hw - r, cy - hh, 0),
+            math.pi / 2.0,
+        )
+
+    prof = _largest_profile(sk)
+    if not prof:
+        _log("cap USB-C: no profile")
+        return
+    cut_in = comp.features.extrudeFeatures.createInput(
+        prof, adsk.fusion.FeatureOperations.CutFeatureOperation
+    )
+    cut_in.setDistanceExtent(False, adsk.core.ValueInput.createByReal(-(cap_t + 0.2)))
+    try:
+        comp.features.extrudeFeatures.add(cut_in)
+        _log(f"cap USB-C: {w*10:.2f}×{h*10:.2f}mm r={r*10:.2f}mm through {cap_t*10:.2f}mm plate")
+    except Exception as e:
+        _log(f"cap USB-C failed: {e}")
+
+
+def _add_cap_pcb_slot(comp, cap_body, y_off, outline, cap_t,
+                      usbc_h, w, h, depth, gap, usbc_y_shift=0.0):
+    # Min back-wall kept under the slot so the plate stays closed on the outer face.
+    min_back_wall = 0.08  # 0.8 mm
+    xs = [pt[0] for pt in outline]
+    zs = [pt[1] for pt in outline]
+    cx = (min(xs) + max(xs)) / 2.0
+    profile_cy = (min(zs) + max(zs)) / 2.0 + y_off + usbc_y_shift
+
+    usbc_bottom_y = profile_cy - usbc_h / 2.0
+    slot_top_y = usbc_bottom_y - gap
+    slot_cy = slot_top_y - h / 2.0
+
+    max_depth = cap_t - min_back_wall
+    if depth > max_depth:
+        _log(f"cap PCB slot: depth {depth*10:.2f}mm > cap_t-0.8mm "
+             f"({max_depth*10:.2f}mm); trimmed")
+        depth = max_depth
+    if depth <= 0 or h <= 0 or w <= 0:
+        _log("cap PCB slot: non-positive size, skipped")
+        return
+
+    slot_plane = _offset_plane(comp, comp.xYConstructionPlane, cap_t,
+                               f"cap_pcb_slot_plane_{id(cap_body)}")
+    sk = comp.sketches.add(slot_plane)
+    sk.name = f"cap_pcb_slot_{id(cap_body)}"
+
+    hw = w / 2.0
+    hh = h / 2.0
+    sk.sketchCurves.sketchLines.addTwoPointRectangle(
+        adsk.core.Point3D.create(cx - hw, slot_cy - hh, 0),
+        adsk.core.Point3D.create(cx + hw, slot_cy + hh, 0),
+    )
+    prof = _largest_profile(sk)
+    if not prof:
+        _log("cap PCB slot: no profile")
+        return
+    cut_in = comp.features.extrudeFeatures.createInput(
+        prof, adsk.fusion.FeatureOperations.CutFeatureOperation
+    )
+    # Sketch plane is at z=cap_t (inner face); cut toward -Z into the plate.
+    cut_in.setDistanceExtent(False, adsk.core.ValueInput.createByReal(-depth))
+    try:
+        comp.features.extrudeFeatures.add(cut_in)
+        _log(f"cap PCB slot: {w*10:.2f}×{h*10:.2f}mm depth {depth*10:.2f}mm, "
+             f"gap below USB-C {gap*10:.2f}mm")
+    except Exception as e:
+        _log(f"cap PCB slot failed: {e}")
+
+
+def build_end_caps(parent, panels, depth, t, p, tab_h=0.0):
     """Flush-fit end caps. Outer outline matches the folded box's outer envelope, so
     cap + body share the same width. Pocket is an ANNULAR groove that receives the
     sheet's thinned axial end (see thin_sheet_ends): the ring between the outer and
@@ -1151,7 +2051,7 @@ def build_end_caps(parent, panels, depth, t, p):
          f"pocket_outer=+{(t-ring_w)*10:.2f}mm pocket_inner=-{clr*10:.2f}mm "
          f"recess={recess_d*10:.2f}mm (thin_depth={(ring_w+clr)*10:.2f}mm)")
 
-    gap = 0.5
+    gap = 1.0  # 10 mm between sheet (incl. tab) and first end cap, and between caps
     max_py = max(pt[1] for pt in plate_outline)
     min_py = min(pt[1] for pt in plate_outline)
     plate_h = max_py - min_py
@@ -1167,7 +2067,7 @@ def build_end_caps(parent, panels, depth, t, p):
             )
 
     for idx in range(2):
-        y_off = -(max_py + gap + idx * (plate_h + gap))
+        y_off = -(tab_h + max_py + gap + idx * (plate_h + gap))
 
         # Plate: solid extrude of the outer outline
         sk = cap_comp.sketches.add(cap_comp.xYConstructionPlane)
@@ -1219,6 +2119,31 @@ def build_end_caps(parent, panels, depth, t, p):
         corner_r = p.get("endcap_corner_r", 0.0)
         if corner_r > 1e-4:
             _fillet_cap_corners(cap_comp, plate_body, cap_t, recess_d, corner_r, ring_w)
+
+        if idx == 0 and p.get("switch_hole"):
+            _add_switch_boss_hole(cap_comp, plate_body, y_off, plate_outline,
+                                  cap_t, p["switch_boss_d"], p["switch_boss_h"],
+                                  p["switch_hole_d"],
+                                  tap_thread=p.get("switch_tap_thread", False))
+        if idx == 0 and p.get("cap1_plain_hole"):
+            _add_cap_plain_hole(cap_comp, plate_body, y_off, plate_outline,
+                                cap_t, p["cap1_plain_hole_d"])
+        if idx == 1 and p.get("cap2_usbc_port"):
+            usbc_y_shift = p.get("cap2_usbc_y_off", 0.0)
+            _add_cap_usbc_cutout(cap_comp, plate_body, y_off, plate_outline,
+                                 cap_t,
+                                 p["cap2_usbc_w"], p["cap2_usbc_h"],
+                                 p["cap2_usbc_r"],
+                                 y_shift=usbc_y_shift)
+            if p.get("cap2_pcb_slot"):
+                _add_cap_pcb_slot(cap_comp, plate_body, y_off, plate_outline,
+                                  cap_t,
+                                  p["cap2_usbc_h"],
+                                  p["cap2_pcb_slot_w"],
+                                  p["cap2_pcb_slot_h"],
+                                  p["cap2_pcb_slot_d"],
+                                  p["cap2_pcb_slot_gap"],
+                                  usbc_y_shift=usbc_y_shift)
 
 
 def profile_outline(profile, top_w, bot_w, height):
